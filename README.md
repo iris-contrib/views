@@ -473,4 +473,4 @@ The engines kept their names and their methods. Three things changed around them
 
 ## License
 
-BSD 3-Clause, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
