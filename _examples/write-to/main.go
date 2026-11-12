@@ -1,12 +1,35 @@
+// An engine renders into any io.Writer, with no request and no server.
+//
+// ExecuteTemplate is the whole view.Engine interface, and it is all that
+// view.Render calls. This program calls it itself to build the body of an
+// e-mail: the page email/simple.html inside the layout layouts/email.html,
+// written into a strings.Builder. The same call writes to a file, to a
+// bytes.Buffer in a test or to os.Stdout.
+//
+// Learn: render a template outside a handler.
+//
+// Run:
+//
+//	go run .
+//
+// It prints the HTML of the e-mail.
+//
+// Next: ../herotemplate
 package main
 
 import (
-	"os"
-
-	"github.com/kataras/iris/v14"
+	"embed"
+	"fmt"
+	"log"
+	"strings"
 
 	"github.com/iris-contrib/views"
 )
+
+// views/email/simple.html and views/layouts/email.html.
+//
+//go:embed views
+var viewsFS embed.FS
 
 type mailData struct {
 	Title    string
@@ -16,29 +39,23 @@ type mailData struct {
 }
 
 func main() {
-	app := iris.New()
-	app.Logger().SetLevel("debug")
-
-	templates := views.HTML("./views", ".html")
+	templates := views.HTML(viewsFS, ".html").RootDir("views")
 	if err := templates.Load(); err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
-	// Or a string-buffered writer to use its body to send an e-mail
-	// for sending e-mails you can use the https://github.com/kataras/go-mailer
-	// or any other third-party package you like.
-	//
-	// The template's parsed result will be written to that writer.
-	writer := os.Stdout
-	err := templates.ExecuteTemplate(writer, "email/simple.html", "layouts/email.html", mailData{
+	// The writer. Hand body.String() to the package you send e-mails with.
+	var body strings.Builder
+
+	err := templates.ExecuteTemplate(&body, "email/simple.html", "layouts/email.html", mailData{
 		Title:    "This is my e-mail title",
 		Body:     "This is my e-mail body",
 		RefTitle: "Iris web framework",
 		RefLink:  "https://iris-go.com",
 	})
 	if err != nil {
-		app.Logger().Errorf("error from app.View: %v", err)
+		log.Fatal(err)
 	}
 
-	app.Listen(":8080")
+	fmt.Println(body.String())
 }

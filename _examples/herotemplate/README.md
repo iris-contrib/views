@@ -1,26 +1,39 @@
-# Hero Template Example
+# Hero template example
 
-This folder contains the iris version of the original hero's example: https://github.com/shiyanhui/hero/tree/master/examples/app.
+The Iris version of the example that [hero](https://github.com/shiyanhui/hero) ships: https://github.com/shiyanhui/hero/tree/master/examples/app.
 
-Iris is 100% compatible with `net/http` so you don't have to change anything else
-except the handler input from the original example.
+hero compiles its templates to Go functions. A generated function writes into a `*bytes.Buffer` or into an `io.Writer`, and the Iris `Context` is an `io.Writer`, so a handler calls it directly. No engine of the `views` package is involved.
 
-The only inline handler's changes were:
-
-From:
+Against the original `net/http` example, a handler changes in two places:
 
 ```go
+// net/http
 if _, err := w.Write(buffer.Bytes()); err != nil {
 // and
 template.UserListToWriter(userList, w)
 ```
-To: 
+
 ```go
-if _, err := ctx.Write(buffer.Bytes()); err != nil {
+// Iris
+ctx.HTML(buffer.String())
 // and
 template.UserListToWriter(userList, ctx)
 ```
 
-So easy.
+## Run
 
-Read more at: https://github.com/shiyanhui/hero
+```sh
+go run .
+```
+
+```sh
+curl localhost:8080/users
+curl localhost:8080/users/writer
+```
+
+The Go code under `template` is generated and committed. After a change to a template, generate it again:
+
+```sh
+go install github.com/shiyanhui/hero/hero@latest
+hero -source=./template
+```

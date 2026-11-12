@@ -1,3 +1,33 @@
+// HTML from github.com/shiyanhui/hero, a template engine that compiles its
+// templates to Go code.
+//
+// hero needs no engine of the views package and no view middleware: the
+// functions it generates write HTML into a bytes.Buffer or into an io.Writer,
+// and the Iris Context is an io.Writer. The files under ./template are the
+// templates and the Go code generated from them, which is committed, so the
+// example runs as it is.
+//
+// It is a module of its own, so that hero is not a dependency of the views
+// package.
+//
+// Learn: serve the output of a compiled template engine from a handler,
+// through a buffer and by writing straight to the response.
+//
+// Run:
+//
+//	go run .
+//
+// Try:
+//
+//	curl localhost:8080/users          # 200, the list, rendered into a buffer first
+//	curl localhost:8080/users/writer   # 200, the same list, written straight to the response
+//
+// After a change to a template, generate the Go code again:
+//
+//	go install github.com/shiyanhui/hero/hero@latest
+//	hero -source=./template
+//
+// Next: ../quicktemplate
 package main
 
 import (
@@ -6,48 +36,38 @@ import (
 	"github.com/iris-contrib/views/_examples/herotemplate/template"
 
 	"github.com/kataras/iris/v14"
-	"github.com/kataras/iris/v14/middleware/compress"
+	"github.com/kataras/iris/v14/rest/errors"
 )
 
-// $ go get github.com/shiyanhui/hero/hero@latest
-// $ go run app.go
-//
-// Read more at https://github.com/shiyanhui/hero/hero
+var userList = []string{
+	"Alice",
+	"Bob",
+	"Tom",
+}
 
 func main() {
 	app := iris.New()
-	app.Use(compress.Handler)
 
-	app.Get("/users", func(ctx iris.Context) {
-		ctx.SetContentType("text/html")
-
-		userList := []string{
-			"Alice",
-			"Bob",
-			"Tom",
-		}
-
-		// Had better use buffer sync.Pool.
-		// Hero(github.com/shiyanhui/hero/hero) exports GetBuffer and PutBuffer for this.
-		//
-		// buffer := hero.GetBuffer()
-		// defer hero.PutBuffer(buffer)
-		// buffer := new(bytes.Buffer)
-		// template.UserList(userList, buffer)
-		// ctx.Write(buffer.Bytes())
-
-		// iris context implements the io.Writer:
-		// _, err := template.UserListToWriter(userList, ctx)
-		// OR:
-		buffer := new(bytes.Buffer)
-		template.UserList(userList, buffer)
-
-		_, err := ctx.Write(buffer.Bytes())
-		if err != nil {
-			ctx.StopWithError(iris.StatusInternalServerError, err)
-			return
-		}
-	})
+	app.Get("/users", users)
+	app.Get("/users/writer", usersToWriter)
 
 	app.Listen(":8080")
+}
+
+// users renders into a buffer, so nothing is sent when the template fails.
+// hero has a pool of buffers for this, hero.GetBuffer and hero.PutBuffer.
+func users(ctx iris.Context) {
+	buffer := new(bytes.Buffer)
+	template.UserList(userList, buffer)
+
+	ctx.HTML(buffer.String())
+}
+
+// usersToWriter gives the Context itself to the template.
+func usersToWriter(ctx iris.Context) {
+	ctx.SetContentType("text/html")
+
+	if _, err := template.UserListToWriter(userList, ctx); err != nil {
+		errors.Internal.LogErr(ctx, err)
+	}
 }

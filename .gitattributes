@@ -1,0 +1,4 @@
+# The test fixtures are read by parsers that care about line structure (Pug,
+# Ace) and their output is compared with exact strings. A checkout with
+# core.autocrlf, the default of Git for Windows, would hand the tests CRLF.
+testdata/** text eol=lf

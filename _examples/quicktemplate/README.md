@@ -1,19 +1,33 @@
-First of all, install [quicktemplate](https://github.com/valyala/quicktemplate) package and [quicktemplate compiler](https://github.com/valyala/quicktemplate/tree/master/qtc)
+# Quicktemplate example
+
+[quicktemplate](https://github.com/valyala/quicktemplate) compiles its templates to Go code. The generated code writes into an `io.Writer`, and the Iris `Context` is an `io.Writer`, so a handler calls it directly. No engine of the `views` package is involved.
+
+## Run
+
+The generated `*.qtpl.go` files are committed, so the example runs as it is:
 
 ```sh
-go get -u github.com/valyala/quicktemplate
-go get -u github.com/valyala/quicktemplate/qtc
+go run .
 ```
 
-The example has the Go code compiled already for you, therefore:
 ```sh
-go run main.go # http://localhost:8080
+curl localhost:8080/
+curl localhost:8080/yourname
 ```
 
-However there is an instruction below, full documentation can be found at https://github.com/valyala/quicktemplate.
+The test sends the same two requests in memory:
 
-Save your template files into `templates` folder under the extension *.qtpl, open your terminal and run `qtc` inside this folder.
+```sh
+go test .
+```
 
-If all went ok, `*.qtpl.go` files must appear in the `templates` folder. These files contain the Go code for  all `*.qtpl` files.
+## Changing a template
 
-> Remember, each time you change a  a `/templates/*.qtpl` file you have to run the `qtc` command and re-build your application.
+The templates are the `*.qtpl` files under `templates`. After a change, generate the Go code again with the quicktemplate compiler, `qtc`, and build the program again:
+
+```sh
+go install github.com/valyala/quicktemplate/qtc@latest
+qtc -dir=./templates
+```
+
+The full documentation is at https://github.com/valyala/quicktemplate.

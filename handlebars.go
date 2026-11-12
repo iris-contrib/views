@@ -5,12 +5,15 @@ import (
 	"html/template"
 	"io"
 	"io/fs"
-	"os"
+	"maps"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 
-	"github.com/kataras/iris/v14/context"
+	"github.com/kataras/iris/v14/middleware/view"
 
 	"github.com/mailgun/raymond/v2"
 )
@@ -21,19 +24,45 @@ type HandlebarsEngine struct {
 	// files configuration
 	rootDir   string
 	extension string
-	// Not used anymore.
-	// assetFn   func(name string) ([]byte, error) // for embedded, in combination with directory & extension
-	// namesFn   func() []string                   // for embedded, in combination with directory & extension
-	reload bool // if true, each time the ExecuteTemplate is called the templates will be reloaded.
+	reload    atomic.Bool // if true, each time the ExecuteTemplate is called the templates will be reloaded.
 	// parser configuration
-	layout        string
-	rmu           sync.RWMutex
-	funcs         template.FuncMap
-	templateCache map[string]*raymond.Template
+	layout string
+
+	// mu guards funcs and custom. A request can add a helper, through
+	// view.AddFunc, while another one is loading the engine.
+	mu     sync.RWMutex
+	funcs  template.FuncMap
+	custom []handlebarsTmp // the templates of ParseTemplate, parsed again on every load.
+
+	loader    loader
+	templates atomic.Pointer[handlebarsSet] // the result of the last load that succeeded.
+}
+
+type handlebarsTmp struct {
+	name     string
+	contents string
+	funcs    template.FuncMap
+}
+
+// handlebarsSet is one finished parse of the templates of an engine.
+type handlebarsSet struct {
+	ext       string
+	templates map[string]*raymond.Template
+}
+
+func (set *handlebarsSet) resolve(name string) (*raymond.Template, bool) {
+	name, ok := resolveName(name, set.ext, func(name string) bool {
+		_, ok := set.templates[name]
+		return ok
+	})
+
+	return set.templates[name], ok
 }
 
 var (
-	_ Engine = (*HandlebarsEngine)(nil)
+	_ view.Engine         = (*HandlebarsEngine)(nil)
+	_ view.EngineFuncer   = (*HandlebarsEngine)(nil)
+	_ view.EngineExtenser = (*HandlebarsEngine)(nil)
 )
 
 // Handlebars creates and returns a new handlebars view engine.
@@ -41,41 +70,30 @@ var (
 //
 // Usage:
 // Handlebars("./views", ".html") or
-// Handlebars(embed.FS, ".html") or Handlebars(AssetFile(), ".html") for embedded data.
+// Handlebars(embed.FS, ".html").RootDir("views") for embedded templates.
 func Handlebars(fs any, extension string) *HandlebarsEngine {
 	s := &HandlebarsEngine{
-		fs:            getFS(fs),
-		rootDir:       "/",
-		extension:     extension,
-		templateCache: make(map[string]*raymond.Template),
-		funcs:         make(template.FuncMap), // global
+		fs:        getFS(fs),
+		rootDir:   "/",
+		extension: extension,
+		funcs:     make(template.FuncMap), // for the templates of this engine.
 	}
-
-	// register the render helper here
-	raymond.RegisterHelper("render", func(partial string, binding any) raymond.SafeString {
-		contents, err := s.executeTemplateBuf(partial, binding)
-		if err != nil {
-			return raymond.SafeString("template with name: " + partial + " couldn't not be found.")
-		}
-		return raymond.SafeString(contents)
-	})
 
 	return s
 }
 
 // RootDir sets the directory to be used as a starting point
 // to load templates from the provided file system.
+// It is what points the engine at a directory of an embed.FS.
+//
+// It panics if root is not a valid path inside the file system.
 func (s *HandlebarsEngine) RootDir(root string) *HandlebarsEngine {
-	if s.fs != nil && root != "" && root != "/" && root != "." && root != s.rootDir {
-		sub, err := fs.Sub(s.fs, s.rootDir)
-		if err != nil {
-			panic(err)
-		}
-
-		s.fs = sub // here so the "middleware" can work.
+	root = filepath.ToSlash(root)
+	if root != s.rootDir {
+		s.fs = subFS(s.fs, root)
 	}
 
-	s.rootDir = filepath.ToSlash(root)
+	s.rootDir = root
 	return s
 }
 
@@ -91,179 +109,281 @@ func (s *HandlebarsEngine) Ext() string {
 }
 
 // Reload if set to true the templates are reloading on each render,
-// use it when you're in development and you're boring of restarting
+// use it when you're in development and you don't want to restart
 // the whole app when you edit a template file.
 //
-// Note that if `true` is passed then only one `View -> ExecuteTemplate` will be render each time,
-// no concurrent access across clients, use it only on development status.
-// It's good to be used side by side with the https://github.com/kataras/rizla reloader for go source files.
+// Every render then parses all templates first, one render at a time.
+// Do not use it in production.
 func (s *HandlebarsEngine) Reload(developmentMode bool) *HandlebarsEngine {
-	s.reload = developmentMode
+	s.reload.Store(developmentMode)
 	return s
 }
 
-// Layout sets the layout template file which should use
-// the {{ yield . }} func to yield the main template file
-// and optionally {{partial/partial_r/render . }} to render
-// other template files like headers and footers.
+// Layout sets the layout template file, which prints the page where it
+// says {{ yield }} and may use {{ render "name" . }} to render other
+// template files like headers and footers.
+//
+// The page reaches the layout as a "yield" entry of the template data, so a
+// render through a layout needs the data to be a map[string]any or nil.
 func (s *HandlebarsEngine) Layout(layoutFile string) *HandlebarsEngine {
 	s.layout = layoutFile
 	return s
 }
 
-// AddFunc adds a function to the templates.
+// AddFunc adds a helper to the templates of this engine.
 // It is legal to overwrite elements of the default actions:
-// - url func(routeName string, args ...string) string
-// - urlpath func(routeName string, args ...string) string
-// - render func(fullPartialName string) (raymond.HTML, error).
+// - render func(fullPartialName string, binding any) raymond.SafeString.
+//
+// A helper is given to a template when it is parsed, so it takes effect at
+// the next load: add it before Load, or before the first render of an
+// engine that loads itself.
 func (s *HandlebarsEngine) AddFunc(funcName string, funcBody any) {
-	s.rmu.Lock()
+	s.mu.Lock()
 	s.funcs[funcName] = funcBody
-	s.rmu.Unlock()
+	s.mu.Unlock()
 }
 
 // AddGlobalFunc registers a global template function for all Handlebars view engines.
+// A name that is registered already is replaced.
+//
+// It panics, as raymond does, if funcBody is not a function with one result.
 func (s *HandlebarsEngine) AddGlobalFunc(funcName string, funcBody any) {
-	s.rmu.Lock()
+	// Checked here, before the helper of that name is taken out: raymond
+	// would refuse it only after.
+	if fn := reflect.TypeOf(funcBody); fn == nil || fn.Kind() != reflect.Func || fn.NumOut() != 1 {
+		panic(fmt.Errorf("handlebars: the helper %s must be a function with one result but it is a %T", funcName, funcBody))
+	}
+
+	handlebarsRegistry.Lock()
+	defer handlebarsRegistry.Unlock()
+
+	// raymond panics for a name it knows already.
+	raymond.RemoveHelper(funcName)
 	raymond.RegisterHelper(funcName, funcBody)
-	s.rmu.Unlock()
 }
 
+// handlebarsRegistry serializes the registrations this package makes in the
+// process-wide registry of raymond.
+var handlebarsRegistry sync.Mutex
+
 // Load parses the templates to the engine.
-// It is responsible to add the necessary global functions.
+//
+// Calling it is optional: an engine that was never loaded loads itself on
+// its first ExecuteTemplate. Call it at startup to find a template that does
+// not parse before the first request does.
+//
+// It may be called again to parse everything anew. If it fails then, the
+// templates of the previous load keep rendering.
 //
 // Returns an error if something bad happens, user is responsible to catch it.
 func (s *HandlebarsEngine) Load() error {
-	if s.IsLoaded() {
-		return nil // already loaded.
-	}
-
-	rootDirName := getRootDirName(s.fs)
-
-	return walk(s.fs, "", func(path string, info os.FileInfo, _ error) error {
-		if info == nil || info.IsDir() {
-			return nil
-		}
-
-		if s.extension != "" {
-			if !strings.HasSuffix(path, s.extension) {
-				return nil
-			}
-		}
-
-		if s.rootDir == rootDirName {
-			path = strings.TrimPrefix(path, rootDirName)
-			path = strings.TrimPrefix(path, "/")
-		}
-
-		contents, err := asset(s.fs, path)
-		if err != nil {
-			return err
-		}
-		return s.ParseTemplate(path, string(contents), nil)
-	})
+	return s.loader.load(s.build)
 }
 
 // IsLoaded reports whether the templates are loaded at least once or not.
 func (s *HandlebarsEngine) IsLoaded() bool {
-	// If only custom templates should be loaded.
-	return (s.fs == nil || context.IsNoOpFS(s.fs)) && len(s.templateCache) > 0
+	return s.loader.loaded()
 }
 
 // ParseTemplate adds a custom template from text.
+// The funcs are helpers for this template alone.
+//
+// A template given here is kept, and parsed again on every load. When it
+// returns an error, nothing was added.
 func (s *HandlebarsEngine) ParseTemplate(name string, contents string, funcs template.FuncMap) error {
-	s.rmu.Lock()
-	defer s.rmu.Unlock()
+	tmpl := handlebarsTmp{name: strings.TrimPrefix(name, "/"), contents: contents, funcs: funcs}
 
-	name = strings.TrimPrefix(name, "/")
-	tmpl, err := raymond.Parse(contents)
-	if err == nil {
-		// Add functions for this template.
-		for k, v := range s.funcs {
-			tmpl.RegisterHelper(k, v)
-		}
+	return s.loader.add(func(attempted bool) error {
+		s.mu.RLock()
+		custom := upsert(s.custom, tmpl, func(c handlebarsTmp) bool { return c.name == tmpl.name })
+		s.mu.RUnlock()
 
-		for k, v := range funcs {
-			tmpl.RegisterHelper(k, v)
-		}
-
-		s.templateCache[name] = tmpl
-	}
-
-	return err
-}
-
-func (s *HandlebarsEngine) fromCache(relativeName string) *raymond.Template {
-	if s.reload {
-		s.rmu.RLock()
-		defer s.rmu.RUnlock()
-	}
-
-	if tmpl, ok := s.templateCache[relativeName]; ok {
-		return tmpl
-	}
-
-	return nil
-}
-
-func (s *HandlebarsEngine) executeTemplateBuf(name string, binding any) (string, error) {
-	if tmpl := s.fromCache(name); tmpl != nil {
-		return tmpl.Exec(binding)
-	}
-	return "", nil
-}
-
-// ExecuteTemplate executes a template and writes its result to the w writer.
-func (s *HandlebarsEngine) ExecuteTemplate(w io.Writer, filename string, layout string, bindingData any) error {
-	// re-parse the templates if reload is enabled.
-	if s.reload {
-		if err := s.Load(); err != nil {
-			return err
-		}
-	}
-
-	isLayout := false
-	layout = getLayout(layout, s.layout)
-	renderFilename := filename
-
-	if layout != "" {
-		isLayout = true
-		renderFilename = layout // the render becomes the layout, and the name is the partial.
-	}
-
-	if tmpl := s.fromCache(renderFilename); tmpl != nil {
-		binding := bindingData
-		if isLayout {
-			var context map[string]any
-			if m, is := binding.(map[string]any); is { // handlebars accepts maps,
-				context = m
-			} else {
-				return fmt.Errorf("please provide a map[string]any type as the binding instead of the %#v", binding)
-			}
-
-			contents, err := s.executeTemplateBuf(filename, binding)
-			if err != nil {
+		if attempted {
+			// Loaded already: build with it, so that it renders at once.
+			if err := s.buildWith(custom); err != nil {
 				return err
 			}
-			if context == nil {
-				context = make(map[string]any, 1)
-			}
-			// I'm implemented the {{ yield . }} as with the rest of template engines, so this is not inneed for iris, but the user can do that manually if want
-			// there is no performance cost: raymond.RegisterPartialTemplate(name, tmpl)
-			context["yield"] = raymond.SafeString(contents)
-		}
-
-		res, err := tmpl.Exec(binding)
-		if err != nil {
+		} else if _, err := s.parse([]handlebarsTmp{tmpl}); err != nil {
+			// Not loaded yet: parse it now, so that a template that does
+			// not parse is refused here and not by the first render.
 			return err
 		}
-		_, err = fmt.Fprint(w, res)
+
+		s.mu.Lock()
+		s.custom = custom
+		s.mu.Unlock()
+		return nil
+	})
+}
+
+// build parses every template and, when all of them parse, publishes the
+// result. The loader calls it, one call at a time.
+func (s *HandlebarsEngine) build() error {
+	s.mu.RLock()
+	custom := slices.Clone(s.custom)
+	s.mu.RUnlock()
+
+	return s.buildWith(custom)
+}
+
+// buildWith is build with the given templates as the ones of ParseTemplate.
+func (s *HandlebarsEngine) buildWith(sources []handlebarsTmp) error {
+	files, err := readTemplates(s.fs, s.extension)
+	if err != nil {
 		return err
 	}
 
-	return ErrTemplateNotFound{
-		Name:     fmt.Sprintf("%s (file: %s)", renderFilename, filename),
-		IsLayout: false,
-		Data:     bindingData,
+	for _, file := range files {
+		sources = append(sources, handlebarsTmp{name: file.name, contents: string(file.contents)})
 	}
+
+	set, err := s.parse(sources)
+	if err != nil {
+		return err
+	}
+
+	if len(set.templates) == 0 {
+		return ErrNoTemplates
+	}
+
+	s.templates.Store(set)
+	return nil
+}
+
+// parse parses the given templates into a new set.
+func (s *HandlebarsEngine) parse(sources []handlebarsTmp) (*handlebarsSet, error) {
+	s.mu.RLock()
+	funcs := maps.Clone(s.funcs)
+	s.mu.RUnlock()
+
+	set := &handlebarsSet{
+		ext:       s.extension,
+		templates: make(map[string]*raymond.Template, len(sources)),
+	}
+
+	for _, source := range sources {
+		tmpl, err := raymond.Parse(source.contents)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", source.name, err)
+		}
+
+		// The helpers belong to the template and not to the process-wide
+		// registry of raymond, which is what lets two engines live in one
+		// program. One map, so that a name is registered once: raymond
+		// panics on the second.
+		helpers := map[string]any{"render": set.render}
+		maps.Copy(helpers, funcs)
+		maps.Copy(helpers, source.funcs)
+		tmpl.RegisterHelpers(helpers)
+
+		set.templates[source.name] = tmpl
+	}
+
+	return set, nil
+}
+
+// handlebarsDepth is the entry of the private data of raymond that counts
+// how deep the render helper is.
+const handlebarsDepth = "views.render.depth"
+
+// render is the helper behind {{ render "name" . }}.
+// raymond turns its panic into the error of the render.
+func (set *handlebarsSet) render(partial string, binding any, options *raymond.Options) raymond.SafeString {
+	tmpl, ok := set.resolve(partial)
+	if !ok {
+		panic(ErrTemplateNotFound{Name: partial, Data: binding})
+	}
+
+	// A template that renders itself would overflow the stack, which Go
+	// cannot recover from. The depth travels in the private data of the
+	// execution, so it belongs to this render alone.
+	depth, _ := options.Data(handlebarsDepth).(int)
+	if depth >= maxTemplateNesting {
+		panic(fmt.Errorf("render %s: more than %d templates deep, does a template render itself?", partial, maxTemplateNesting))
+	}
+
+	frame := options.NewDataFrame()
+	frame.Set(handlebarsDepth, depth+1)
+
+	contents, err := tmpl.ExecWith(binding, frame)
+	if err != nil {
+		panic(fmt.Errorf("render %s: %w", partial, err))
+	}
+
+	return raymond.SafeString(contents)
+}
+
+// ExecuteTemplate executes a template and writes its result to the w writer.
+// The layout is the layout argument or, when that is empty, the one set by
+// Layout. NoLayout renders the template without any. A render through a
+// layout needs the data to be a map[string]any or nil.
+//
+// The engine loads itself first if it was never loaded.
+// It returns a view.ErrTemplateNotFound for a template or a layout that
+// does not exist. Nothing is written to w when the execution fails.
+func (s *HandlebarsEngine) ExecuteTemplate(w io.Writer, filename string, layout string, bindingData any) error {
+	// parses the templates when they were never loaded, and
+	// re-parses them if reload is enabled.
+	if err := s.loader.ready(s.reload.Load(), s.build); err != nil {
+		return err
+	}
+
+	set := s.templates.Load()
+
+	tmpl, ok := set.resolve(filename)
+	if !ok {
+		return ErrTemplateNotFound{Name: filename, IsLayout: false, Data: bindingData}
+	}
+
+	binding := bindingData
+
+	if layout = getLayout(layout, s.layout); layout != "" {
+		layoutTmpl, ok := set.resolve(layout)
+		if !ok {
+			return ErrTemplateNotFound{Name: layout, IsLayout: true, Data: bindingData}
+		}
+
+		// The page goes to the layout as one more entry of the data. The
+		// entry is added to a copy: the map may be one that every request
+		// shares, as the one of view.WithData is.
+		var data map[string]any
+
+		switch m := bindingData.(type) {
+		case nil:
+			data = make(map[string]any, 1)
+		case map[string]any: // handlebars accepts maps,
+			data = make(map[string]any, len(m)+1)
+			maps.Copy(data, m)
+		default:
+			return fmt.Errorf("handlebars: a layout needs the template data to be a map[string]any but it is a %T", bindingData)
+		}
+
+		contents, err := execHandlebars(tmpl, bindingData)
+		if err != nil {
+			return err
+		}
+
+		data["yield"] = raymond.SafeString(contents)
+		tmpl, binding = layoutTmpl, data
+	}
+
+	res, err := execHandlebars(tmpl, binding)
+	if err != nil {
+		return err
+	}
+
+	_, err = io.WriteString(w, res)
+	return err
+}
+
+// execHandlebars executes a template. raymond gives back the panic of a
+// helper when it is a runtime error, such as an index out of range.
+func execHandlebars(tmpl *raymond.Template, binding any) (res string, err error) {
+	err = protect(func() error {
+		var err error
+		res, err = tmpl.Exec(binding)
+		return err
+	})
+
+	return
 }

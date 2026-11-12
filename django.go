@@ -2,15 +2,18 @@ package views
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"io/fs"
-	"os"
+	"maps"
 	stdPath "path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 
-	"github.com/kataras/iris/v14/context"
+	"github.com/kataras/iris/v14/middleware/view"
 
 	"github.com/fatih/structs"
 	"github.com/flosch/pongo2/v4"
@@ -60,28 +63,32 @@ var AsValue = pongo2.AsValue
 // Shortcut for `pongo2.AsSafeValue`.
 var AsSafeValue = pongo2.AsSafeValue
 
+// tDjangoAssetLoader reads the templates that other templates name with
+// "extends" and "include". Every name is relative to the root of the
+// engine's file system, whichever template it is written in.
 type tDjangoAssetLoader struct {
-	rootDir string
-	fs      fs.FS
+	engine *DjangoEngine
+
+	// reads counts the templates read for the one that is being parsed,
+	// while limited is set. pongo2 parses a template that includes or
+	// extends itself until the stack runs out.
+	limited atomic.Bool
+	reads   atomic.Int64
 }
 
 // Abs calculates the path to a given template. Whenever a path must be resolved
 // due to an import from another template, the base equals the parent template's path.
 func (l *tDjangoAssetLoader) Abs(base, name string) string {
-	if stdPath.IsAbs(name) {
-		return name
-	}
-
-	return stdPath.Join(l.rootDir, name)
+	return stdPath.Join("/", name)
 }
 
 // Get returns an io.Reader where the template's content can be read from.
 func (l *tDjangoAssetLoader) Get(path string) (io.Reader, error) {
-	if stdPath.IsAbs(path) {
-		path = path[1:]
+	if l.limited.Load() && l.reads.Add(1) > maxTemplateReads {
+		return nil, errTooManyReads
 	}
 
-	res, err := asset(l.fs, path)
+	res, err := asset(l.engine.fs, path)
 	if err != nil {
 		return nil, err
 	}
@@ -95,35 +102,47 @@ type DjangoEngine struct {
 	// files configuration
 	rootDir   string
 	extension string
-	reload    bool
-	//
-	rmu sync.RWMutex // locks for filters, globals and `ExecuteWiter` when `reload` is true.
-	// filters for pongo2, map[name of the filter] the filter function . The filters are auto register
-	filters map[string]FilterFunction
+	reload    atomic.Bool
+
+	// mu guards globals and custom. A request can add a global, through
+	// view.AddFunc, while other requests render.
+	mu sync.RWMutex
 	// globals share context fields between templates.
-	globals       map[string]any
-	Set           *pongo2.TemplateSet
-	templateCache map[string]*pongo2.Template
+	globals map[string]any
+	custom  []customTmp // the templates of ParseTemplate, parsed again on every load.
+
+	loader    loader
+	templates atomic.Pointer[map[string]*pongo2.Template] // the result of the last load that succeeded.
+
+	// Set is the pongo2 template set of the engine.
+	// It is nil until the first Load, ParseTemplate or render, unless the
+	// application assigns one of its own before that.
+	Set     *pongo2.TemplateSet
+	setOnce sync.Once
+	assets  tDjangoAssetLoader
 }
 
 var (
-	_ Engine = (*DjangoEngine)(nil)
+	_ view.Engine         = (*DjangoEngine)(nil)
+	_ view.EngineFuncer   = (*DjangoEngine)(nil)
+	_ view.EngineExtenser = (*DjangoEngine)(nil)
 )
 
 // Django creates and returns a new django view engine.
 // The given "extension" MUST begin with a dot.
 //
+// A Django template names its own parent with {% extends %}, so the layout
+// argument of ExecuteTemplate is ignored by this engine.
+//
 // Usage:
 // Django("./views", ".html") or
-// Django(embed.FS, ".html") or Django(AssetFile(), ".html") for embedded data.
+// Django(embed.FS, ".html").RootDir("views") for embedded templates.
 func Django(fs any, extension string) *DjangoEngine {
 	s := &DjangoEngine{
-		fs:            getFS(fs),
-		rootDir:       "/",
-		extension:     extension,
-		globals:       make(map[string]any),
-		filters:       make(map[string]FilterFunction),
-		templateCache: make(map[string]*pongo2.Template),
+		fs:        getFS(fs),
+		rootDir:   "/",
+		extension: extension,
+		globals:   make(map[string]any),
 	}
 
 	return s
@@ -131,17 +150,16 @@ func Django(fs any, extension string) *DjangoEngine {
 
 // RootDir sets the directory to be used as a starting point
 // to load templates from the provided file system.
+// It is what points the engine at a directory of an embed.FS.
+//
+// It panics if root is not a valid path inside the file system.
 func (s *DjangoEngine) RootDir(root string) *DjangoEngine {
-	if s.fs != nil && root != "" && root != "/" && root != "." && root != s.rootDir {
-		sub, err := fs.Sub(s.fs, s.rootDir)
-		if err != nil {
-			panic(err)
-		}
-
-		s.fs = sub // here so the "middleware" can work.
+	root = filepath.ToSlash(root)
+	if root != s.rootDir {
+		s.fs = subFS(s.fs, root)
 	}
 
-	s.rootDir = filepath.ToSlash(root)
+	s.rootDir = root
 	return s
 }
 
@@ -157,42 +175,39 @@ func (s *DjangoEngine) Ext() string {
 }
 
 // Reload if set to true the templates are reloading on each render,
-// use it when you're in development and you're boring of restarting
+// use it when you're in development and you don't want to restart
 // the whole app when you edit a template file.
 //
-// Note that if `true` is passed then only one `View -> ExecuteTemplate` will be render each time,
-// no concurrent access across clients, use it only on development status.
-// It's good to be used side by side with the https://github.com/kataras/rizla reloader for go source files.
+// Every render then parses all templates first, one render at a time.
+// Do not use it in production.
 func (s *DjangoEngine) Reload(developmentMode bool) *DjangoEngine {
-	s.reload = developmentMode
+	s.reload.Store(developmentMode)
 	return s
 }
 
 // AddFunc adds the function to the template's Globals.
-// It is legal to overwrite elements of the default actions:
-// - url func(routeName string, args ...string) string
-// - urlpath func(routeName string, args ...string) string
-// - render func(fullPartialName string) (template.HTML, error).
+// A template calls it as {{ name(argument) }}.
+// Unlike the other engines, it takes effect at once, loaded or not.
 func (s *DjangoEngine) AddFunc(funcName string, funcBody any) {
-	s.rmu.Lock()
+	s.mu.Lock()
 	s.globals[funcName] = funcBody
-	s.rmu.Unlock()
+	s.mu.Unlock()
 }
 
-// AddFilter registers a new filter. If there's already a filter with the same
-// name, RegisterFilter will panic. You usually want to call this
-// function in the filter's init() function:
-// http://golang.org/doc/effective_go.html#init
+// AddFilter registers a new filter.
 //
 // Same as `RegisterFilter`.
 func (s *DjangoEngine) AddFilter(filterName string, filterBody FilterFunction) *DjangoEngine {
 	return s.registerFilter(filterName, filterBody)
 }
 
-// RegisterFilter registers a new filter. If there's already a filter with the same
-// name, RegisterFilter will panic. You usually want to call this
-// function in the filter's init() function:
-// http://golang.org/doc/effective_go.html#init
+// RegisterFilter registers a new filter.
+//
+// pongo2 keeps its filters in one registry for the whole process. A filter
+// is therefore shared by every Django engine of the program, and a name
+// that is registered again replaces the filter for all of them. Register
+// filters at startup, before anything renders: the registry is not safe to
+// change while templates execute.
 //
 // See http://www.florian-schlachter.de/post/pongo2/ for more about
 // writing filters and tags.
@@ -200,8 +215,21 @@ func (s *DjangoEngine) RegisterFilter(filterName string, filterBody FilterFuncti
 	return s.registerFilter(filterName, filterBody)
 }
 
+// djangoRegistry serializes the registrations this package makes in the
+// process-wide registry of pongo2.
+var djangoRegistry sync.Mutex
+
 func (s *DjangoEngine) registerFilter(filterName string, fn FilterFunction) *DjangoEngine {
-	pongo2.RegisterFilter(filterName, fn)
+	djangoRegistry.Lock()
+	defer djangoRegistry.Unlock()
+
+	// Neither call can fail after the check.
+	if pongo2.FilterExists(filterName) {
+		_ = pongo2.ReplaceFilter(filterName, fn)
+	} else {
+		_ = pongo2.RegisterFilter(filterName, fn)
+	}
+
 	return s
 }
 
@@ -209,128 +237,215 @@ func (s *DjangoEngine) registerFilter(filterName string, fn FilterFunction) *Dja
 // function in the tag's init() function:
 // http://golang.org/doc/effective_go.html#init
 //
+// Tags live in the process-wide registry of pongo2, like filters, and it
+// returns an error for a name that is already registered.
+//
 // See http://www.florian-schlachter.de/post/pongo2/ for more about
 // writing filters and tags.
 func (s *DjangoEngine) RegisterTag(tagName string, fn TagParser) error {
+	djangoRegistry.Lock()
+	defer djangoRegistry.Unlock()
+
 	return pongo2.RegisterTag(tagName, fn)
 }
 
 // Load parses the templates to the engine.
-// It is responsible to add the necessary global functions.
+//
+// Calling it is optional: an engine that was never loaded loads itself on
+// its first ExecuteTemplate. Call it at startup to find a template that does
+// not parse before the first request does.
+//
+// It may be called again to parse everything anew. If it fails then, the
+// templates of the previous load keep rendering.
 //
 // Returns an error if something bad happens, user is responsible to catch it.
 func (s *DjangoEngine) Load() error {
-	if s.IsLoaded() {
-		return nil // already loaded
-	}
-
-	rootDirName := getRootDirName(s.fs)
-
-	return walk(s.fs, "", func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if info == nil || info.IsDir() {
-			return nil
-		}
-
-		if s.extension != "" {
-			if !strings.HasSuffix(path, s.extension) {
-				return nil
-			}
-		}
-
-		if s.rootDir == rootDirName {
-			path = strings.TrimPrefix(path, rootDirName)
-			path = strings.TrimPrefix(path, "/")
-		}
-
-		contents, err := asset(s.fs, path)
-		if err != nil {
-			return err
-		}
-
-		return s.ParseTemplate(path, contents)
-	})
+	return s.loader.load(s.build)
 }
 
 // IsLoaded reports whether the templates are loaded at least once or not.
 func (s *DjangoEngine) IsLoaded() bool {
-	// If only custom templates should be loaded.
-	return (s.fs == nil || context.IsNoOpFS(s.fs)) && len(s.templateCache) > 0
+	return s.loader.loaded()
 }
 
 // ParseTemplate adds a custom template from text.
 // This parser does not support funcs per template. Use the `AddFunc` instead.
+//
+// A template given here is kept, and parsed again on every load. When it
+// returns an error, nothing was added.
 func (s *DjangoEngine) ParseTemplate(name string, contents []byte) error {
-	s.rmu.Lock()
-	defer s.rmu.Unlock()
+	tmpl := customTmp{name: strings.TrimPrefix(name, "/"), contents: contents}
 
-	s.initSet()
+	return s.loader.add(func(attempted bool) error {
+		s.mu.RLock()
+		custom := upsert(s.custom, tmpl, func(c customTmp) bool { return c.name == tmpl.name })
+		s.mu.RUnlock()
 
-	name = strings.TrimPrefix(name, "/")
-	tmpl, err := s.Set.FromBytes(contents)
-	if err == nil {
-		s.templateCache[name] = tmpl
-	}
+		if attempted {
+			// Loaded already: build with it, so that it renders at once.
+			if err := s.buildWith(custom); err != nil {
+				return err
+			}
+		} else if _, err := s.fromBytes(contents); err != nil {
+			// Not loaded yet: parse it now, so that a template that does
+			// not parse is refused here and not by the first render.
+			return err
+		}
 
-	return err
+		s.mu.Lock()
+		s.custom = custom
+		s.mu.Unlock()
+		return nil
+	})
 }
 
-func (s *DjangoEngine) initSet() { // protected by the caller.
-	if s.Set == nil {
-		s.Set = pongo2.NewSet("", &tDjangoAssetLoader{fs: s.fs, rootDir: s.rootDir})
-		s.Set.Globals = getPongoContext(s.globals)
+// set returns the pongo2 set, which is created on first use: the file
+// system it reads from is final only after the engine is configured.
+func (s *DjangoEngine) set() *pongo2.TemplateSet {
+	s.setOnce.Do(func() {
+		s.assets.engine = s
+
+		// The application may have assigned its own.
+		if s.Set == nil {
+			s.Set = pongo2.NewSet("", &s.assets)
+		}
+	})
+
+	return s.Set
+}
+
+// fromBytes parses one template. The loader calls it and ParseTemplate, one
+// call at a time.
+func (s *DjangoEngine) fromBytes(contents []byte) (*pongo2.Template, error) {
+	set := s.set()
+
+	s.assets.reads.Store(0)
+	s.assets.limited.Store(true)
+	defer s.assets.limited.Store(false)
+
+	tmpl, err := set.FromBytes(contents)
+	if s.assets.reads.Load() > maxTemplateReads {
+		// The error of pongo2 is as deep as the recursion was.
+		return nil, errTooManyReads
 	}
+
+	return tmpl, err
+}
+
+// build parses every template and, when all of them parse, publishes the
+// result. The loader calls it, one call at a time.
+func (s *DjangoEngine) build() error {
+	s.mu.RLock()
+	custom := slices.Clone(s.custom)
+	s.mu.RUnlock()
+
+	return s.buildWith(custom)
+}
+
+// buildWith is build with the given templates as the ones of ParseTemplate.
+func (s *DjangoEngine) buildWith(custom []customTmp) error {
+	files, err := readTemplates(s.fs, s.extension)
+	if err != nil {
+		return err
+	}
+
+	templates := make(map[string]*pongo2.Template, len(custom)+len(files))
+
+	for _, tmpl := range custom {
+		if templates[tmpl.name], err = s.fromBytes(tmpl.contents); err != nil {
+			return fmt.Errorf("%s: %w", tmpl.name, err)
+		}
+	}
+
+	for _, file := range files {
+		if templates[file.name], err = s.fromBytes(file.contents); err != nil {
+			return fmt.Errorf("%s: %w", file.name, err)
+		}
+	}
+
+	if len(templates) == 0 {
+		return ErrNoTemplates
+	}
+
+	s.templates.Store(&templates)
+	return nil
 }
 
 // getPongoContext returns the pongo2.Context from map[string]any or from pongo2.Context, used internaly
-func getPongoContext(templateData any) pongo2.Context {
+func getPongoContext(templateData any) (pongo2.Context, error) {
 	if templateData == nil {
-		return nil
+		return nil, nil
 	}
 
 	switch data := templateData.(type) {
 	case pongo2.Context:
-		return data
-	case context.Map:
-		return pongo2.Context(data)
+		return data, nil
+	case map[string]any:
+		return pongo2.Context(data), nil
 	default:
 		// if struct, convert it to map[string]any
 		if structs.IsStruct(data) {
-			return pongo2.Context(structs.Map(data))
+			return pongo2.Context(structs.Map(data)), nil
 		}
 
-		panic("django: template data: should be a map or struct")
+		return nil, fmt.Errorf("django: template data should be a map[string]any or a struct but it is a %T", templateData)
 	}
 }
 
-func (s *DjangoEngine) fromCache(relativeName string) *pongo2.Template {
-	if s.reload {
-		s.rmu.RLock()
-		defer s.rmu.RUnlock()
+// context returns what a template executes with: the globals of the
+// engine, and over them the data of the render.
+func (s *DjangoEngine) context(bindingData any) (pongo2.Context, error) {
+	data, err := getPongoContext(bindingData)
+	if err != nil {
+		return nil, err
 	}
 
-	if tmpl, ok := s.templateCache[relativeName]; ok {
-		return tmpl
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.globals) == 0 {
+		return data, nil
 	}
-	return nil
+
+	// A new map on every render: the data may be a map that every request
+	// shares, as the one of view.WithData is.
+	ctx := make(pongo2.Context, len(s.globals)+len(data))
+	maps.Copy(ctx, s.globals)
+	maps.Copy(ctx, data)
+	return ctx, nil
 }
 
-// ExecuteTemplate executes a templates and write its results to the w writer
-// layout here is useless.
+// ExecuteTemplate executes a template and writes its result to the w writer.
+// The layout is ignored: a Django template names its own parent with
+// {% extends %}.
+//
+// The engine loads itself first if it was never loaded.
+// It returns a view.ErrTemplateNotFound for a template that does not
+// exist. Nothing is written to w when the execution fails.
 func (s *DjangoEngine) ExecuteTemplate(w io.Writer, filename string, _ string, bindingData any) error {
-	// re-parse the templates if reload is enabled.
-	if s.reload {
-		if err := s.Load(); err != nil {
-			return err
-		}
+	// parses the templates when they were never loaded, and
+	// re-parses them if reload is enabled.
+	if err := s.loader.ready(s.reload.Load(), s.build); err != nil {
+		return err
 	}
 
-	if tmpl := s.fromCache(filename); tmpl != nil {
-		return tmpl.ExecuteWriter(getPongoContext(bindingData), w)
+	templates := *s.templates.Load()
+
+	name, ok := resolveName(filename, s.extension, func(name string) bool {
+		_, ok := templates[name]
+		return ok
+	})
+	if !ok {
+		return ErrTemplateNotFound{Name: filename, IsLayout: false, Data: bindingData}
 	}
 
-	return ErrTemplateNotFound{Name: filename, IsLayout: false, Data: bindingData}
+	ctx, err := s.context(bindingData)
+	if err != nil {
+		return err
+	}
+
+	// pongo2 does not recover from a function that panics.
+	return protect(func() error {
+		return templates[name].ExecuteWriter(ctx, w)
+	})
 }

@@ -1,109 +1,129 @@
+// The HTML engine: a directory of templates, rendered through the view middleware.
+//
+// views.HTML reads every .html file under ./templates and parses it with the
+// standard html/template package. app.Use(view.Handler(templates)) stores the
+// engine on each request, and a handler renders with
+// view.Render(ctx, name, layout, data).
+//
+// There is no Load call: an engine that was never loaded parses its templates
+// on the first render. Call templates.Load() at startup when the program
+// should refuse to start with a template that does not parse, as
+// ../embedding-templates-into-app does.
+//
+// The data of a template is a map or a struct. A function that templates call
+// is given to the engine before it loads.
+//
+// Learn: register an engine of this package, render a template with a map and
+// with a struct, and give the templates a function of your own.
+//
+// Run, from this directory, because the templates are read from ./templates:
+//
+//	go run .
+//
+// Try:
+//
+//	curl localhost:8080/                 # 200, hi.html
+//	curl localhost:8080/example_map      # 200, example.html with a map
+//	curl localhost:8080/example_struct   # 200, the same page with a struct
+//	curl localhost:8080/functions        # 200, a template that calls functions
+//
+// Next: ../embedding-templates-into-app
 package main
 
 import (
-	"fmt"
 	"html/template"
+	"strings"
 	"time"
 
-	"github.com/kataras/iris/v14"
-	"github.com/kataras/iris/v14/middleware/compress"
-	"github.com/kataras/iris/v14/middleware/view"
-
 	"github.com/iris-contrib/views"
+
+	"github.com/kataras/iris/v14"
+	"github.com/kataras/iris/v14/middleware/view"
+	"github.com/kataras/iris/v14/rest/errors"
 )
 
-// ViewFunctions presents some builtin functions
-// for html view engines. See `View.Funcs` or `view/html.Funcs` and etc.
-var Functions = template.FuncMap{
-	"Now": time.Now,
+// functions are the functions the templates may call, next to the ones
+// html/template has built in.
+var functions = template.FuncMap{
+	"now":   func() string { return time.Now().Format(time.RFC1123) },
+	"upper": strings.ToUpper,
+}
+
+type book struct {
+	Title string
+	Pages int
+}
+
+// examplePage is the data of example.html as a struct.
+// The template reads the same names from a map.
+type examplePage struct {
+	Name   string
+	Age    int
+	Items  []string
+	Map    map[string]any
+	Nested book
+}
+
+// Initials is a method, which a template calls the way it reads a field.
+func (p examplePage) Initials() string {
+	var initials strings.Builder
+	for word := range strings.FieldsSeq(p.Name) {
+		initials.WriteString(word[:1])
+	}
+	return initials.String()
 }
 
 func main() {
 	app := iris.New()
-	app.UseRouter(compress.Handler)
 
 	templates := views.HTML("./templates", ".html").
-		Funcs(Functions). // Optionally register some more builtin functions.
-		Reload(false)     // Set Reload to true on development.
-	if err := templates.Load(); err != nil {
-		panic(err)
-	}
-	app.UseRouter(view.Handler(templates))
+		Funcs(functions). // before the engine loads: html/template resolves names when it parses.
+		Reload(false)     // true parses the templates again on every render, for development.
 
-	app.Get("/", func(ctx iris.Context) {
-		// the .Name inside the ./templates/hi.html.
-		// view.KeyValue(ctx, "Name", "iris")
-		// err := view.Render(ctx, "hi.html", "", nil);
-		// OR:
-		// Context, template name, layout filename (optional), data (optional).
-		err := view.Render(ctx, "hi.html", "", iris.Map{"Name": "iris"})
-		if err != nil {
-			ctx.HTML(fmt.Sprintf("<h3>%s</h3>", err.Error()))
-			return
-		}
-	})
+	app.Use(view.Handler(templates))
 
-	app.Get("/example_map", func(ctx iris.Context) {
-		examplePage := iris.Map{
-			"Name":   "Example Name",
-			"Age":    42,
-			"Items":  []string{"Example slice entry 1", "entry 2", "entry 3"},
-			"Map":    iris.Map{"map key": "map value", "other key": "other value"},
-			"Nested": iris.Map{"Title": "Iris E-Book", "Pages": 620},
-		}
+	app.Get("/", index)
+	app.Get("/example_map", exampleMap)
+	app.Get("/example_struct", exampleStruct)
+	app.Get("/functions", functionsPage)
 
-		if err := view.Render(ctx, "example.html", "", examplePage); err != nil {
-			ctx.HTML(fmt.Sprintf("<h3>%s</h3>", err.Error()))
-			return
-		}
-	})
-
-	app.Get("/example_struct", func(ctx iris.Context) {
-		type book struct {
-			Title string
-			Pages int
-		}
-
-		var examplePage = struct {
-			Name   string
-			Age    int
-			Items  []string
-			Map    map[string]any
-			Nested book
-		}{
-			"Example Name",
-			42,
-			[]string{"Example slice entry 1", "entry 2", "entry 3"},
-			iris.Map{"map key": "map value", "other key": "other value"},
-			book{
-				"Iris E-Book",
-				620,
-			},
-		}
-
-		if err := view.Render(ctx, "example.html", "", examplePage); err != nil {
-			ctx.HTML(fmt.Sprintf("<h3>%s</h3>", err.Error()))
-			return
-		}
-	})
-
-	app.Get("/functions", func(ctx iris.Context) {
-		var functionsPage = struct {
-			// A function.
-			Now func() time.Time
-			// A struct field which contains methods.
-			Ctx iris.Context
-		}{
-			Now: time.Now,
-			Ctx: ctx,
-		}
-
-		if err := view.Render(ctx, "functions.html", "", functionsPage); err != nil {
-			ctx.HTML(fmt.Sprintf("<h3>%s</h3>", err.Error()))
-			return
-		}
-	})
-
-	// http://localhost:8080/
 	app.Listen(":8080")
+}
+
+func index(ctx iris.Context) {
+	// {{ .Name }} inside ./templates/hi.html.
+	// The arguments: the template, an optional layout and the data.
+	render(ctx, "hi.html", iris.Map{"Name": "iris"})
+}
+
+func exampleMap(ctx iris.Context) {
+	render(ctx, "example.html", iris.Map{
+		"Name":   "Example Name",
+		"Age":    42,
+		"Items":  []string{"Example slice entry 1", "entry 2", "entry 3"},
+		"Map":    iris.Map{"map key": "map value", "other key": "other value"},
+		"Nested": iris.Map{"Title": "Iris E-Book", "Pages": 620},
+	})
+}
+
+func exampleStruct(ctx iris.Context) {
+	render(ctx, "example.html", examplePage{
+		Name:   "Example Name",
+		Age:    42,
+		Items:  []string{"Example slice entry 1", "entry 2", "entry 3"},
+		Map:    iris.Map{"map key": "map value", "other key": "other value"},
+		Nested: book{Title: "Iris E-Book", Pages: 620},
+	})
+}
+
+func functionsPage(ctx iris.Context) {
+	render(ctx, "functions.html", examplePage{Name: "Example Name"})
+}
+
+// render writes a template, or a generic 500 when that fails. The error of a
+// template names files, lines and data fields, so it is logged and not sent.
+func render(ctx iris.Context, name string, data any) {
+	if err := view.Render(ctx, name, "", data); err != nil {
+		errors.Internal.LogErr(ctx, err)
+	}
 }

@@ -1,8 +1,11 @@
 package views
 
 import (
+	"fmt"
+	"html/template"
 	"strings"
-	"sync"
+
+	"github.com/kataras/iris/v14/middleware/view"
 
 	"github.com/yosssi/ace"
 )
@@ -14,6 +17,12 @@ type AceEngine struct {
 
 	indent string
 }
+
+var (
+	_ view.Engine         = (*AceEngine)(nil)
+	_ view.EngineFuncer   = (*AceEngine)(nil)
+	_ view.EngineExtenser = (*AceEngine)(nil)
+)
 
 // SetIndent string used for indentation.
 // Do NOT use tabs, only spaces characters.
@@ -30,46 +39,32 @@ func (s *AceEngine) SetIndent(indent string) *AceEngine {
 // Ace minifies the response automatically unless
 // SetIndent() method is set.
 //
+// Every file is compiled on its own into html/template text, so the
+// actions of the html engine ({{ yield . }}, {{ render "name" . }} and the
+// rest) and its layouts work the same. The "= include" helper of Ace
+// becomes a {{ template }} action: give it the name of the file with its
+// extension, as in "= include partials/footer.ace .". The base and inner
+// templates of Ace ("= yield" and "= content") are not available, use a
+// layout instead.
+//
 // Read more about the Ace Go Parser: https://github.com/yosssi/ace
 //
 // Usage:
 // Ace("./views", ".ace") or
-// Ace(embed.FS, ".ace") or Ace(AssetFile(), ".ace") for embedded data.
+// Ace(embed.FS, ".ace").RootDir("views") for embedded templates.
 func Ace(fs any, extension string) *AceEngine {
 	s := &AceEngine{HTMLEngine: HTML(fs, extension), indent: ""}
 	s.name = "Ace"
 
-	funcs := make(map[string]any)
-
-	once := new(sync.Once)
-
-	s.middleware = func(name string, text []byte) (contents string, err error) {
-		once.Do(func() { // on first template parse, all funcs are given.
-			for k, v := range s.getBuiltinFuncs(name) {
-				funcs[k] = v
-			}
-
-			for k, v := range s.funcs {
-				funcs[k] = v
-			}
-		})
-
-		//	name = path.Join(path.Clean(directory), name)
-
+	s.middleware = func(name string, text []byte, funcs template.FuncMap) (contents string, err error) {
 		src := ace.NewSource(
 			ace.NewFile(name, text),
 			ace.NewFile("", []byte{}),
 			[]*ace.File{},
 		)
 
-		if strings.Contains(name, "layout") {
-			for k, v := range s.layoutFuncs {
-				funcs[k] = v
-			}
-		}
-
 		opts := &ace.Options{
-			Extension:  extension[1:],
+			Extension:  strings.TrimPrefix(extension, "."),
 			FuncMap:    funcs,
 			DelimLeft:  s.left,
 			DelimRight: s.right,
@@ -86,7 +81,12 @@ func Ace(fs any, extension string) *AceEngine {
 			return "", err
 		}
 
-		return t.Lookup(name).Tree.Root.String(), nil
+		compiled := t.Lookup(name)
+		if compiled == nil || compiled.Tree == nil {
+			return "", fmt.Errorf("ace: nothing was compiled")
+		}
+
+		return compiled.Tree.Root.String(), nil
 	}
 
 	return s

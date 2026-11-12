@@ -1,3 +1,3 @@
-<h1>Function: {{ Now }}</h1>
-<h1>Field: {{ .Ctx.Request.URL.Path }} </h1>
-<h1>Field Struct's Function (Method): {{ .Ctx.FullRequestURI }} </h1>
+<h1>A function of the engine: {{ now }}</h1>
+<h1>A function with an argument: {{ upper .Name }}</h1>
+<h1>A method of the data: {{ .Initials }}</h1>

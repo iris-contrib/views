@@ -1,0 +1,2 @@
+{{ extends "layouts/main.jet" }}
+{{ block main() }}<p>page:extended Hello {{ .Name }}</p>{{ end }}

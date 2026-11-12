@@ -13,40 +13,45 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
 
     strategy:
+      fail-fast: false
       matrix:
-        go_version: [1.24.x]
+        # Windows too: a file handle that is left open only fails there.
+        os: [ubuntu-latest, windows-latest]
+
     steps:
 
-    - name: Check out code into the Go module directory
-      uses: actions/checkout@v4
-    #   with:
-    #     persist-credentials: false
-    #     token: ${{ secrets.GH_ACCESS_TOKEN }}
-    # - name: Granting private modules access
-    #   run: |
-    #    git config --global url."https://${{ secrets.GH_ACCESS_TOKEN }}:@github.com/".insteadOf "https://github.com"
-    # - name: Get dependencies
-    #   env:
-    #     GOPRIVATE: github.com/*
-    #   run: |
-    #     go mod download
+    - name: Check out code
+      uses: actions/checkout@v7
 
-    - name: Set up Go 1.x
-      uses: actions/setup-go@v5
+    - name: Set up Go
+      uses: actions/setup-go@v7
       with:
-        go-version-file: './go.mod'
+        go-version-file: go.mod
         check-latest: true
     - run: go version
 
-    - name: Test
-      run: go test -v ./...
+    - name: Vet
+      run: go vet ./...
 
-    - name: Setup examples for testing
-      run: ./.github/scripts/setup_examples_test.bash
-    - name: Test examples
-      continue-on-error: true
-      working-directory: _examples
-      run: go test -v -cover -race ./...
+    - name: Test
+      run: go test -race ./...
+
+    # A directory that starts with an underscore is not part of "./...".
+    # An example with a go.mod is a module of its own, the rest belong to
+    # the root module.
+    - name: Build the examples
+      shell: bash
+      run: |
+        out="$(mktemp -d)"
+        for dir in _examples/*/; do
+          echo "::group::${dir}"
+          if [ -f "${dir}go.mod" ]; then
+            (cd "${dir}" && go vet ./... && go build -o "${out}/" ./... && go test -race ./...)
+          else
+            go vet "./${dir}" && go build -o "${out}/" "./${dir}"
+          fi
+          echo "::endgroup::"
+        done

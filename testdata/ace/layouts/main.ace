@@ -1,0 +1,4 @@
+html
+  body
+    header layout:main
+    {{ yield . }}
